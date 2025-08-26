@@ -4,15 +4,18 @@ import folium
 from datetime import date, timedelta
 import requests
 import time
+import os
 
-# --- Page Configuration ---
+# --- Page Configuration & File Paths ---
 st.set_page_config(layout="wide", page_title="GlobalX Fleet Tracker")
+WORKING_DIRECTORY = r"C:\Users\nicol\Downloads" 
+AIRCRAFT_LIST_XLSX = os.path.join(WORKING_DIRECTORY, "GlobalX flight tracking.xlsx")
+AIRPORTS_CSV_PATH = os.path.join(WORKING_DIRECTORY, "airports.csv")
 
 # --- Helper Functions with Caching ---
-
-@st.cache_data(ttl="6h") # Cache data for 6 hours
+@st.cache_data(ttl="6h")
 def load_file_data(file_path, is_excel=False):
-    """Loads data from CSV or Excel, caching the result."""
+    """Loads and caches data from CSV or Excel."""
     try:
         if is_excel:
             return pd.read_excel(file_path)
@@ -72,27 +75,22 @@ def find_nearest_airport(lat, lon, airports_df):
 # --- Main App Interface ---
 st.title("✈️ GlobalX Fleet Activity Dashboard")
 
-# Load foundational data
-aircraft_df = load_file_data("GlobalX flight tracking.xlsx", is_excel=True)
-airports_df = load_file_data("airports.csv")
+aircraft_df = load_file_data(AIRCRAFT_LIST_XLSX, is_excel=True)
+airports_df = load_file_data(AIRPORTS_CSV_PATH)
 
 if aircraft_df is None or airports_df is None:
     st.stop()
 
-# Clean airport data once
 airports_df.dropna(subset=['latitude', 'longitude', 'name', 'municipality'], inplace=True)
 
-# Sidebar for aircraft selection
 st.sidebar.title("Aircraft Selection")
 registration_list = aircraft_df['Registration'].dropna().unique()
 selected_registration = st.sidebar.selectbox("Choose an aircraft:", registration_list)
 
-# Main panel display
 if selected_registration:
     aircraft_details = aircraft_df[aircraft_df['Registration'] == selected_registration].iloc[0]
     selected_icao = aircraft_details['icao']
     
-    # Fetch data for the selected aircraft (will be cached)
     with st.spinner(f"Fetching & processing yearly flight data for {selected_registration}... (This may take a few minutes on first load per aircraft)"):
         flight_df = fetch_flight_data_for_aircraft(selected_icao, selected_registration)
 
@@ -102,7 +100,6 @@ if selected_registration:
         
     st.header(f"Displaying Data for: {selected_registration}")
     
-    # --- Display aircraft details ---
     col1, col2, col3 = st.columns(3)
     col1.metric("Aircraft Model", aircraft_details.get("Aircraft", "N/A"))
     col2.metric("Type", aircraft_details.get("Type", "N/A"))
@@ -113,13 +110,17 @@ if selected_registration:
     # --- Generate a flight summary DataFrame on-the-fly ---
     flight_df.sort_values(by='absolute_timestamp', inplace=True)
     flight_df['time_diff'] = flight_df['absolute_timestamp'].diff().dt.total_seconds()
-    flight_segments = (flight_df['time_diff'] > (4 * 3600)) | (flight_df['flight_callsign'] != flight_df['flight_callsign'].shift())
+    
+    # CORRECTED LOGIC: Forward-fill missing callsigns to prevent false flight breaks
+    flight_df['filled_callsign'] = flight_df['flight_callsign'].fillna(method='ffill')
+    
+    flight_segments = (flight_df['time_diff'] > (4 * 3600)) | \
+                      (flight_df['filled_callsign'] != flight_df['filled_callsign'].shift())
     flight_df['flight_id'] = flight_segments.cumsum()
     
-    # Create a summary of individual flights
     summary_list = []
     for flight_id, segment in flight_df.groupby('flight_id'):
-        if not segment.empty:
+        if not segment.empty and pd.notna(segment.iloc[0]['filled_callsign']):
             start_record = segment.iloc[0]
             end_record = segment.iloc[-1]
             summary_list.append({
@@ -131,36 +132,34 @@ if selected_registration:
 
     st.divider()
     
-    # --- Display Analytics ---
-    stats_col1, stats_col2 = st.columns(2)
-    
-    with stats_col1:
-        st.subheader("Top 5 Most Visited Destinations")
-        top_5 = summary_df[summary_df['arrival_airport'] != 'Unknown Airfield or Location']['arrival_airport'].value_counts().nlargest(5)
-        st.dataframe(top_5)
+    if not summary_df.empty:
+        stats_col1, stats_col2 = st.columns(2)
+        with stats_col1:
+            st.subheader("Top 5 Most Visited Destinations")
+            top_5 = summary_df[summary_df['arrival_airport'] != 'Unknown Airfield or Location']['arrival_airport'].value_counts().nlargest(5)
+            st.dataframe(top_5)
 
-    with stats_col2:
-        st.subheader("Last 5 Unique Destinations")
-        known_destinations = summary_df[summary_df['arrival_airport'] != 'Unknown Airfield or Location']
-        last_five = known_destinations['arrival_airport'].unique()[-5:]
-        st.markdown("\n".join([f"- {loc}" for loc in last_five]))
+        with stats_col2:
+            st.subheader("Last 5 Unique Destinations")
+            known_destinations = summary_df[summary_df['arrival_airport'] != 'Unknown Airfield or Location']
+            last_five = pd.Series([loc for loc in known_destinations['arrival_airport'] if loc not in pd.Series(known_destinations['arrival_airport']).unique()[-6:-1]]).unique()[-5:]
+            st.markdown("\n".join([f"- {loc}" for loc in last_five]))
 
-    st.subheader("Monthly Flight Activity")
-    # Ensure months are sorted chronologically for the chart
-    summary_df['month'] = pd.Categorical(
-        summary_df['departure_time'].dt.strftime('%B'),
-        categories=["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
-        ordered=True
-    )
-    monthly_counts = summary_df['month'].value_counts().sort_index()
-    st.line_chart(monthly_counts)
+        st.subheader("Monthly Flight Activity")
+        summary_df['month'] = pd.Categorical(summary_df['departure_time'].dt.strftime('%B'),
+                                             categories=["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+                                             ordered=True)
+        monthly_counts = summary_df['month'].value_counts().sort_index()
+        st.line_chart(monthly_counts)
+    else:
+        st.info("No distinct flight segments were long enough to be summarized.")
 
-    # --- Display the Map ---
+
     st.divider()
     st.subheader("Interactive Flight Map")
     map_center = [flight_df['latitude'].mean(), flight_df['longitude'].mean()]
     m = folium.Map(location=map_center, zoom_start=4, tiles="CartoDB positron")
-    colors = ['#3388ff', '#f58733', '#52b552', '#d43737', '#9355dc', '#333333'] # Blue, Orange, Green, Red, Purple, Black
+    colors = ['#3388ff', '#f58733', '#52b552', '#d43737', '#9355dc', '#333333']
     
     for i, segment in flight_df.groupby('flight_id'):
         points = segment[['latitude', 'longitude']].dropna().values.tolist()
