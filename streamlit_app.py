@@ -8,7 +8,7 @@ import os
 
 # --- Page Configuration & File Paths ---
 st.set_page_config(layout="wide", page_title="GlobalX Fleet Tracker")
-WORKING_DIRECTORY = r"C:\Users\nicol\Downloads" 
+WORKING_DIRECTORY = r"C:\Users\nicol\Downloads"
 AIRCRAFT_LIST_XLSX = os.path.join(WORKING_DIRECTORY, "GlobalX flight tracking.xlsx")
 AIRPORTS_CSV_PATH = os.path.join(WORKING_DIRECTORY, "airports.csv")
 
@@ -111,24 +111,31 @@ if selected_registration:
     flight_df.sort_values(by='absolute_timestamp', inplace=True)
     flight_df['time_diff'] = flight_df['absolute_timestamp'].diff().dt.total_seconds()
     
-    # CORRECTED LOGIC: Forward-fill missing callsigns to prevent false flight breaks
-    flight_df['filled_callsign'] = flight_df['flight_callsign'].fillna(method='ffill')
+    # CORRECTED LOGIC: Replicating the robust logic from the pre-processing script.
+    flight_summaries = []
+    flight_start_index = 0
+    for i in range(1, len(flight_df)):
+        is_new_flight = (flight_df['time_diff'].iloc[i] > 4*3600 or
+                        (flight_df['flight_callsign'].iloc[i] != flight_df['flight_callsign'].iloc[i-1] and pd.notna(flight_df['flight_callsign'].iloc[i])))
+        if is_new_flight:
+            segment = flight_df.iloc[flight_start_index:i]
+            if not segment.empty:
+                start, end = segment.iloc[0], segment.iloc[-1]
+                flight_summaries.append({
+                    "departure_airport": find_nearest_airport(start['latitude'], start['longitude'], airports_df),
+                    "arrival_airport": find_nearest_airport(end['latitude'], end['longitude'], airports_df),
+                    "departure_time": start['absolute_timestamp']})
+            flight_start_index = i
     
-    flight_segments = (flight_df['time_diff'] > (4 * 3600)) | \
-                      (flight_df['filled_callsign'] != flight_df['filled_callsign'].shift())
-    flight_df['flight_id'] = flight_segments.cumsum()
-    
-    summary_list = []
-    for flight_id, segment in flight_df.groupby('flight_id'):
-        if not segment.empty and pd.notna(segment.iloc[0]['filled_callsign']):
-            start_record = segment.iloc[0]
-            end_record = segment.iloc[-1]
-            summary_list.append({
-                "departure_airport": find_nearest_airport(start_record['latitude'], start_record['longitude'], airports_df),
-                "arrival_airport": find_nearest_airport(end_record['latitude'], end_record['longitude'], airports_df),
-                "departure_time": start_record['absolute_timestamp']
-            })
-    summary_df = pd.DataFrame(summary_list)
+    last_segment = flight_df.iloc[flight_start_index:]
+    if not last_segment.empty:
+        start, end = last_segment.iloc[0], last_segment.iloc[-1]
+        flight_summaries.append({
+            "departure_airport": find_nearest_airport(start['latitude'], start['longitude'], airports_df),
+            "arrival_airport": find_nearest_airport(end['latitude'], end['longitude'], airports_df),
+            "departure_time": start['absolute_timestamp']})
+            
+    summary_df = pd.DataFrame(flight_summaries)
 
     st.divider()
     
@@ -141,8 +148,9 @@ if selected_registration:
 
         with stats_col2:
             st.subheader("Last 5 Unique Destinations")
-            known_destinations = summary_df[summary_df['arrival_airport'] != 'Unknown Airfield or Location']
-            last_five = pd.Series([loc for loc in known_destinations['arrival_airport'] if loc not in pd.Series(known_destinations['arrival_airport']).unique()[-6:-1]]).unique()[-5:]
+            # Drop duplicates but keep the last occurrence to preserve order
+            unique_destinations = summary_df[summary_df['arrival_airport'] != 'Unknown Airfield or Location'].drop_duplicates(subset='arrival_airport', keep='last')
+            last_five = unique_destinations['arrival_airport'].tail(5).tolist()
             st.markdown("\n".join([f"- {loc}" for loc in last_five]))
 
         st.subheader("Monthly Flight Activity")
@@ -160,6 +168,11 @@ if selected_registration:
     map_center = [flight_df['latitude'].mean(), flight_df['longitude'].mean()]
     m = folium.Map(location=map_center, zoom_start=4, tiles="CartoDB positron")
     colors = ['#3388ff', '#f58733', '#52b552', '#d43737', '#9355dc', '#333333']
+    
+    # Use the same correct logic to generate flight IDs for coloring the map
+    flight_df['filled_callsign'] = flight_df['flight_callsign'].fillna(method='ffill')
+    flight_segments = (flight_df['time_diff'] > (4 * 3600)) | (flight_df['filled_callsign'] != flight_df['filled_callsign'].shift())
+    flight_df['flight_id'] = flight_segments.cumsum()
     
     for i, segment in flight_df.groupby('flight_id'):
         points = segment[['latitude', 'longitude']].dropna().values.tolist()
